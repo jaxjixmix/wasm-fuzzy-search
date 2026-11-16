@@ -80,7 +80,8 @@
 
 <script type="module">
 import * as ref from './js/reference.js';
-import { generateCorpus, packCorpus, QUERIES } from './js/corpus.js';
+import { generateCorpus, packCorpus } from './js/corpus.js';
+import { runBenchmark, checkExports, u8, u32v } from './js/bench.js';
 
 const logEl = document.getElementById('log');
 const statusEl = document.getElementById('status');
@@ -89,22 +90,12 @@ const log = (m) => { logEl.textContent += m + '\n'; };
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-const u8 = (mem, ptr, len) => new Uint8Array(mem.buffer, ptr, len);
-const u32v = (mem, ptr, elems) => new Uint32Array(mem.buffer, ptr, elems);
 
 async function loadWasm() {
   const res = await fetch(`./pkg/fuzzy.wasm?v=${Date.now()}`);
   if (!res.ok) throw new Error(`fetch failed ${res.status} — run \`npm run build:wasm\``);
   const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
   return instance.exports;
-}
-
-const median = (xs) => { const a=[...xs].sort((p,q)=>p-q); const m=a.length>>1;
-  return a.length%2?a[m]:(a[m-1]+a[m])/2; };
-function timeIt(fn, warmup=3, runs=12){
-  for(let i=0;i<warmup;i++) fn();
-  const s=[]; for(let i=0;i<runs;i++){const t0=performance.now();fn();s.push(performance.now()-t0);}
-  return median(s);
 }
 
 btn.addEventListener('click', async () => {
@@ -122,151 +113,105 @@ btn.addEventListener('click', async () => {
 });
 
 async function run(ex) {
-  const mem = ex.memory;
   const cBody = document.querySelector('#correctness tbody');
   const sBody = document.querySelector('#speed tbody');
-  cBody.innerHTML=''; sBody.innerHTML='';
+  cBody.innerHTML = '';
+  sBody.innerHTML = '';
 
-  const LIMIT = 20;
+  // Fail loudly on ABI drift before producing numbers that look plausible.
+  const arityErr = checkExports(ex);
+  if (arityErr) throw new Error(arityErr);
 
-  for (const n of [500, 5000, 50000]) {
-    const items = generateCorpus(n, 12345 + n);
-    const { blob, offsets } = packCorpus(items);
-    const jsIndex = new ref.Index(blob, offsets);
+  const { correctness, speed } = await runBenchmark(ex, { log });
 
-    // Build wasm index.
-    const pBlob = ex.alloc(blob.length);
-    const pOff = ex.alloc(offsets.length * 4);
-    u8(mem, pBlob, blob.length).set(blob);
-    u32v(mem, pOff, offsets.length).set(offsets);
-    const handle = ex.build_index(pBlob, blob.length, pOff, offsets.length - 1);
-    ex.dealloc(pBlob, blob.length);
-    ex.dealloc(pOff, offsets.length * 4);
-    if (!handle) throw new Error('build_index returned 0');
-
-    // ---- correctness: score parity ----
-    const pN = ex.alloc(64), pH = ex.alloc(1<<16);
-    let diffs = 0, checks = 0, first = null;
-    for (const q of QUERIES) {
-      const needle = enc.encode(q);
-      u8(mem,pN,64).fill(0); u8(mem,pN,needle.length).set(needle);
-      for (let i=0;i<items.length;i++){
-        const c = items[i];
-        u8(mem,pH,c.length).set(c);
-        const got = ex.score_one(pN, needle.length, pH, c.length);
-        const want = ref.score(needle, c);
-        checks++;
-        if (got!==want){ diffs++; if(!first) first={q,cand:dec.decode(c),got,want}; }
-      }
-    }
-    ex.dealloc(pN,64); ex.dealloc(pH,1<<16);
-
-    addRow(cBody, [n.toLocaleString(), `${checks.toLocaleString()} score comparisons`,
-      diffs===0 ? 'identical' : `MISMATCH ${JSON.stringify(first)}`], diffs===0);
-
-    // ---- correctness: query parity + order ----
-    const pOut = ex.alloc(LIMIT*8), pN2 = ex.alloc(64);
-    let qdiffs=0, qfirst=null;
-    for (const q of QUERIES){
-      const needle = enc.encode(q);
-      u8(mem,pN2,64).fill(0); u8(mem,pN2,needle.length).set(needle);
-      const gotN = ex.query_index(handle,pN2,needle.length,LIMIT,pOut,LIMIT);
-      const raw = u32v(mem,pOut,gotN*2).slice();
-      const got=[]; for(let k=0;k<gotN;k++) got.push({score:raw[k*2],index:raw[k*2+1]});
-      const want = jsIndex.query(needle,LIMIT);
-      const same = got.length===want.length && got.every((g,k)=>g.score===want[k].score&&g.index===want[k].index);
-      if(!same){ qdiffs++; if(!qfirst) qfirst={q,got:got.slice(0,5),want:want.slice(0,5)}; }
-    }
-    addRow(cBody, [n.toLocaleString(), `${QUERIES.length} queries, order included`,
-      qdiffs===0 ? 'identical' : `MISMATCH ${JSON.stringify(qfirst)}`], qdiffs===0);
-
-    // ---- speed ----
-    let jsT=0, wT=0;
-    for (const q of QUERIES){
-      const needle = enc.encode(q);
-      u8(mem,pN2,64).fill(0); u8(mem,pN2,needle.length).set(needle);
-      jsT += timeIt(()=>jsIndex.query(needle,LIMIT));
-      wT  += timeIt(()=>ex.query_index(handle,pN2,needle.length,LIMIT,pOut,LIMIT));
-    }
-    sBody.appendChild(speedRow(n, jsT, wT, QUERIES.length));
-    log(`${n.toLocaleString()} items: JS ${jsT.toFixed(2)}ms → WASM ${wT.toFixed(2)}ms (${(jsT/wT).toFixed(2)}x)`);
-
-    ex.dealloc(pOut,LIMIT*8); ex.dealloc(pN2,64);
-
-    // Keep the 50k index for the live query panel.
-    if (n === 50000) { mountLive(ex, handle, jsIndex, blob, offsets); }
-    else ex.free_index(handle);
+  for (const c of correctness) {
+    addRow(cBody, [
+      c.size ? c.size.toLocaleString() : '—',
+      `${c.check} (${c.checks.toLocaleString()})`,
+      c.ok ? 'identical' : `MISMATCH ${c.detail}`,
+    ], c.ok);
   }
 
-  log(`live index handles: ${ex.live_indexes()}`);
+  for (const s of speed) sBody.appendChild(speedRow(s));
+
+  mountLive(ex);
 }
 
 function addRow(tbody, cells, ok) {
   const tr = document.createElement('tr');
   tr.innerHTML = `<td>${cells[0]}</td><td>${cells[1]}</td>` +
-    `<td class="${ok?'ok':'fail'}">${cells[2]}</td>`;
+    `<td class="${ok ? 'ok' : 'fail'}">${cells[2]}</td>`;
   tbody.appendChild(tr);
 }
 
-function speedRow(n, jsT, wT, nq) {
+function speedRow(s) {
   const tr = document.createElement('tr');
-  tr.innerHTML = `<td>${n.toLocaleString()}</td>` +
-    `<td class="num">${jsT.toFixed(1)} ms</td>` +
-    `<td class="num">${wT.toFixed(1)} ms</td>` +
-    `<td class="num">${(jsT/wT).toFixed(2)}x</td>` +
-    `<td class="num">${(jsT/nq).toFixed(2)} ms</td>` +
-    `<td class="num">${(wT/nq).toFixed(2)} ms</td>`;
+  tr.innerHTML = `<td>${s.size.toLocaleString()}</td>` +
+    `<td class="num">${s.jsTotal.toFixed(1)} ms</td>` +
+    `<td class="num">${s.wasmTotal.toFixed(1)} ms</td>` +
+    `<td class="num">${s.speedup.toFixed(2)}x</td>` +
+    `<td class="num">${s.jsPerQuery.toFixed(2)} ms</td>` +
+    `<td class="num">${s.wasmPerQuery.toFixed(2)} ms</td>`;
   return tr;
 }
 
-/** Wire the live-query input against the 50k index on both sides. */
-function mountLive(ex, handle, jsIndex, blob, offsets) {
+/** Live query panel. Builds its own index so it is independent of the bench. */
+function mountLive(ex) {
   const mem = ex.memory;
-  const LIMIT = 10;
+  const LL = 10;
+  const items = generateCorpus(5000, 999);
+  const { blob, offsets } = packCorpus(items);
+  const jsIndex = new ref.Index(blob, offsets);
 
-  // Keep the wasm-side corpus alive for rendering hits.
   const pBlob = ex.alloc(blob.length);
-  const pOff = ex.alloc(offsets.length*4);
-  u8(mem,pBlob,blob.length).set(blob);
-  u32v(mem,pOff,offsets.length).set(offsets);
+  const pOff = ex.alloc(offsets.length * 4);
+  u8(mem, pBlob, blob.length).set(blob);
+  u32v(mem, pOff, offsets.length).set(offsets);
+  const handle = ex.build_index(pBlob, blob.length, pOff, offsets.length - 1);
+  ex.dealloc(pBlob, blob.length);
+  ex.dealloc(pOff, offsets.length * 4);
+  if (!handle) throw new Error('live index build failed');
 
-  const pN = ex.alloc(64), pOut = ex.alloc(LIMIT*8);
+  const pN = ex.alloc(64);
+  const pOut = ex.alloc(LL * 8);
   const input = document.getElementById('q');
   const jsHits = document.getElementById('jsHits');
   const wasmHits = document.getElementById('wasmHits');
   const lat = document.getElementById('lat');
 
+  const fmt = (idx) => {
+    const start = offsets[idx], end = offsets[idx + 1];
+    return dec.decode(blob.subarray(start, end));
+  };
+
   const render = () => {
     const q = input.value;
-    if (!q) { jsHits.innerHTML=''; wasmHits.innerHTML=''; lat.textContent=''; return; }
+    if (!q) { jsHits.innerHTML = ''; wasmHits.innerHTML = ''; lat.textContent = ''; return; }
     const needle = enc.encode(q);
 
-    // JS side, timed.
     const t0 = performance.now();
-    const jsRes = jsIndex.query(needle, LIMIT);
+    const jsRes = jsIndex.query(needle, LL);
     const jsMs = performance.now() - t0;
 
-    // wasm side, timed.
-    u8(mem,pN,64).fill(0); u8(mem,pN,needle.length).set(needle);
+    u8(mem, pN, 64).fill(0);
+    u8(mem, pN, needle.length).set(needle);
     const t1 = performance.now();
-    const n = ex.query_index(handle,pN,needle.length,LIMIT,pOut,LIMIT);
+    const n = ex.query_index(handle, pN, needle.length, LL, pOut, LL);
     const wasmMs = performance.now() - t1;
-    const raw = u32v(mem,pOut,n*2).slice();
 
-    const fmt = (idx) => {
-      const start = offsets[idx], end = offsets[idx+1];
-      return dec.decode(blob.subarray(start,end));
-    };
+    const raw = u32v(mem, pOut, n * 2).slice();
 
-    jsHits.innerHTML = jsRes.map(h =>
+    jsHits.innerHTML = jsRes.map((h) =>
       `<div class="hit"><b>${h.score}</b> ${escapeHtml(fmt(h.index))}</div>`).join('');
-    const wh = [];
-    for (let k=0;k<n;k++) wh.push({score:raw[k*2], index:raw[k*2+1]});
-    wasmHits.innerHTML = wh.map(h =>
-      `<div class="hit"><b>${h.score}</b> ${escapeHtml(fmt(h.index))}</div>`).join('');
+
+    let wh = '';
+    for (let k = 0; k < n; k++) {
+      wh += `<div class="hit"><b>${raw[k * 2]}</b> ${escapeHtml(fmt(raw[k * 2 + 1]))}</div>`;
+    }
+    wasmHits.innerHTML = wh;
 
     lat.textContent = `JS ${jsMs.toFixed(2)} ms · WASM ${wasmMs.toFixed(2)} ms` +
-      (wasmMs > 0 ? ` · ${(jsMs/wasmMs).toFixed(2)}x` : '');
+      (wasmMs > 0 ? ` · ${(jsMs / wasmMs).toFixed(2)}x` : '');
   };
 
   input.addEventListener('input', render);
@@ -275,7 +220,7 @@ function mountLive(ex, handle, jsIndex, blob, offsets) {
 
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 }
 </script>

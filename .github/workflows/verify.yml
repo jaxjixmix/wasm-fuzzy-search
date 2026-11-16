@@ -37,6 +37,12 @@ jobs:
       - name: Differential verification (Rust vs JS reference)
         run: node scripts/verify.mjs
 
+      # The benchmark logic lives in web/js/bench.js so it can be run headlessly.
+      # It was inline in index.html before, where no test could reach it - the
+      # same structural gap that let a wrong-arity call hide in wasm-image-lab.
+      - name: Browser harness end-to-end
+        run: node scripts/verify-browser-harness.mjs
+
       - name: Upload wasm artifact
         uses: actions/upload-artifact@v4
         with:

@@ -1,0 +1,14 @@
+{
+  "name": "wasm-fuzzy-search",
+  "version": "0.1.0",
+  "description": "fzf-style fuzzy search index in Rust/WASM, differential-tested against a JS reference with identical data layout.",
+  "type": "module",
+  "scripts": {
+    "build:wasm": "cargo build -p wasm --release --target wasm32-unknown-unknown && mkdir -p web/pkg && cp target/wasm32-unknown-unknown/release/wasm.wasm web/pkg/fuzzy.wasm",
+    "verify": "node scripts/verify.mjs",
+    "serve": "npx --yes http-server web -p 8081 -c-1",
+    "bench": "npm run build:wasm && npm run serve"
+  },
+  "license": "MIT",
+  "private": true
+}

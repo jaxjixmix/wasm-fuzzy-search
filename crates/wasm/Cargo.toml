@@ -1,0 +1,12 @@
+[package]
+name = "wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Raw C-ABI surface over the fuzzy index. No wasm-bindgen, same approach as wasm-image-lab."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fuzzy = { path = "../fuzzy" }
